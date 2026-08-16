@@ -1,8 +1,8 @@
 @echo off
-title WikiBuddy Launcher
+title Lipi AI Launcher
 
 echo ===================================================
-echo               WIKIBUDDY LAUNCHER
+echo               LIPI AI LAUNCHER
 echo ===================================================
 
 :: Start the FastAPI backend in a new command prompt window
@@ -17,4 +17,4 @@ echo.
 echo Both services have been launched in separate windows!
 echo You can close this launcher window now.
 echo.
-timeout /t 5
+ping -n 3 127.0.0.1 >nul

@@ -28,17 +28,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import upload, chat
 from app.config import UPLOAD_DIR, CHROMA_PERSIST_DIR
 
-# ---- Clear Chroma DB on startup ----
-if os.path.exists(CHROMA_PERSIST_DIR):
-    try:
-        shutil.rmtree(CHROMA_PERSIST_DIR)
-        print(f"Cleared Chroma DB on startup: {CHROMA_PERSIST_DIR}")
-    except Exception as e:
-        print(f"Error clearing Chroma DB on startup: {e}")
+
 
 # ---- Create the FastAPI app ----
 app = FastAPI(
-    title="Smart Study Companion API",
+    title="Lipi AI Backend API",
     description="A local AI-powered study assistant using LangChain, Chroma, and Ollama.",
     version="1.0.1",
 )
@@ -79,6 +73,6 @@ async def root():
     This confirms the server is running.
     """
     return {
-        "message": "Smart Study Companion API is running!",
+        "message": "Lipi AI API is running!",
         "docs": "Visit /docs for the interactive API documentation.",
     }

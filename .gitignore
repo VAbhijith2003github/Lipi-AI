@@ -20,6 +20,11 @@ Desktop.ini
 .env.test.local
 .env.production.local
 *.env
+*credentials*.json
+*service_account*.json
+gcp_key.json
+key.json
+
 
 # Python / Backend
 __pycache__/
@@ -38,6 +43,8 @@ backend/.venv/
 backend/env/
 
 # Python Testing & Tooling
+tests/
+run_tests.bat
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

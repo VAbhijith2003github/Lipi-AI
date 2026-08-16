@@ -20,7 +20,7 @@
  *       only talk to the Main Process through IPC for security reasons.
  */
 
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, Menu } = require('electron');
 const path = require('path');
 
 // Check if we're running in development mode
@@ -28,13 +28,23 @@ const path = require('path');
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
 function createWindow() {
+  // Disable default menu bar (File, Edit, View, Window, Help)
+  Menu.setApplicationMenu(null);
+
   // ---- Create the browser window ----
   const mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 900,
     minHeight: 600,
-    title: 'WikiBuddy — Smart Study Companion',
+    title: 'Lipi AI — Smart Document Assistant',
+    autoHideMenuBar: true,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#e53935',
+      symbolColor: '#ffffff',
+      height: 52
+    },
     webPreferences: {
       // preload.js acts as a secure bridge between Main and Renderer processes
       preload: path.join(__dirname, 'preload.js'),
@@ -44,12 +54,14 @@ function createWindow() {
     },
   });
 
+  mainWindow.setMenu(null);
+
   // ---- Load the React app ----
   if (isDev) {
     // In development, load from the Vite dev server
     mainWindow.loadURL('http://localhost:5173');
     // Open DevTools automatically during development
-    mainWindow.webContents.openDevTools();
+    // mainWindow.webContents.openDevTools();
   } else {
     // In production, load the built HTML file
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));

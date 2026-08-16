@@ -9,3 +9,4 @@ pypdf
 pymupdf
 pymupdf4llm
 tiktoken
+docling
