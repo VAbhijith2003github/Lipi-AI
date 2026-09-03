@@ -1,100 +1,212 @@
+import threading
+
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import ChatOllama
-from google import genai
-from google.genai import types
-from app.config import OLLAMA_BASE_URL, OLLAMA_CHAT_MODEL, GEMINI_API_KEY
+
+from app.config import OLLAMA_BASE_URL, OLLAMA_CHAT_MODEL, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU, GEMINI_API_KEY
 from app.rag.retriever import retrieve_context
-import os
+from app.trace import session_tracer
 
+# ---------------------------------------------------------------------------
+# LLM Singletons
+# ---------------------------------------------------------------------------
+_ollama_llm: ChatOllama | None = None
+_ollama_model: str | None = None
+_ollama_lock = threading.Lock()
 
-
-
-def _invoke_gemini(context: str, message: str, chat_history: list, api_key: str = None) -> str:
-    """
-    Call Gemini 3.6 Flash via the Google GenAI SDK using API key.
-    Uses the new client model endpoint.
-    """
-    key = api_key if api_key else GEMINI_API_KEY
-    client = genai.Client(api_key=key)
-
-    system_instruction = (
-        "You are a precise document analysis assistant. Your only job is to answer the user's "
-        "question based strictly on the provided document context. Do not invent, assume, or "
-        "extrapolate any fact. If information is not present in the context, say exactly: "
-        "\"This information is not present in the provided document.\""
-        f"\n\nDOCUMENT CONTEXT:\n{context}"
-    )
-
-    # Build multi-turn content history payload for generate_content
-    contents = []
-    if chat_history:
-        for role, content in chat_history:
-            genai_role = "model" if role == "assistant" else "user"
-            contents.append(
-                types.Content(
-                    role=genai_role,
-                    parts=[types.Part.from_text(text=content)]
+def _get_ollama_llm(force_cpu: bool = False) -> ChatOllama:
+    global _ollama_llm, _ollama_model
+    target_num_gpu = 0 if force_cpu else OLLAMA_NUM_GPU
+    # Double-checked locking: outer read is cheap (no lock), but we re-check
+    # *inside* the lock before creating the instance. This prevents two
+    # concurrent callers from both seeing None and each allocating a ChatOllama
+    # (and requesting VRAM) simultaneously.
+    if _ollama_llm is None or _ollama_model != OLLAMA_CHAT_MODEL or force_cpu:
+        with _ollama_lock:
+            if _ollama_llm is None or _ollama_model != OLLAMA_CHAT_MODEL or force_cpu:
+                _ollama_llm = ChatOllama(
+                    model=OLLAMA_CHAT_MODEL,
+                    base_url=OLLAMA_BASE_URL,
+                    temperature=0.0,
+                    num_ctx=OLLAMA_NUM_CTX,
+                    num_gpu=target_num_gpu,
+                    repeat_penalty=1.2,
+                    top_p=0.1,
+                    keep_alive=0,
                 )
-            )
-    
-    # Append final message
-    contents.append(
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=message)]
-        )
-    )
+                _ollama_model = OLLAMA_CHAT_MODEL
+    return _ollama_llm
 
-    try:
-        response = client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
+_gemini_clients: dict[str, any] = {}
+_gemini_lock = threading.Lock()
+
+def _get_gemini_llm(api_key: str):
+    key = api_key if api_key else GEMINI_API_KEY
+    if not key:
+        raise ValueError("Google API key is required for Gemini mode.")
+    
+    if key in _gemini_clients:
+        return _gemini_clients[key]
+    
+    with _gemini_lock:
+        if key not in _gemini_clients:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            _gemini_clients[key] = ChatGoogleGenerativeAI(
+                model="gemini-3.6-flash",
+                google_api_key=key,
                 temperature=0.0,
                 max_output_tokens=4096,
             )
+    return _gemini_clients[key]
+
+# ---------------------------------------------------------------------------
+# Prompt builder
+# ---------------------------------------------------------------------------
+def _build_messages(context: str, message: str, chat_history: list = None, system_prompt_override: str = None) -> list:
+    messages = []
+    
+    if system_prompt_override:
+        sys_text = system_prompt_override.replace("{context}", context)
+        messages.append(SystemMessage(content=sys_text))
+        if chat_history:
+            for role, content in chat_history:
+                if role == "assistant":
+                    messages.append(AIMessage(content=content))
+                else:
+                    messages.append(HumanMessage(content=content))
+        messages.append(HumanMessage(content=message))
+    else:
+        sys_text = (
+            "You are a precise document analysis assistant. Your only job is to answer the user's "
+            "question based strictly on the provided document context. Do not invent, assume, or "
+            "extrapolate any fact. If information is not present in the context, say exactly: "
+            "\"This information is not present in the provided document.\""
+            "\n\nPay attention to the [Page X | Section: Y] headers in the context to understand the document structure."
         )
-        return response.text
-    except Exception as e:
-        err_msg = str(e)
-        if "429" in err_msg or "quota" in err_msg.lower() or "exhausted" in err_msg.lower():
-            raise RuntimeError(
-                "Gemini API rate limit or quota exceeded. Please wait a moment or try again later. "
-                "Error code: 429 (Resource Exhausted)."
-            ) from e
-        elif "api key" in err_msg.lower() or "400" in err_msg or "invalid" in err_msg.lower() or "key not" in err_msg.lower():
-            if "limit" in err_msg.lower() or "token" in err_msg.lower() or "context" in err_msg.lower() or "exceeded" in err_msg.lower():
-                raise ValueError(
-                    "Token exceeded issue: The prompt context exceeds the Gemini model's token limit. "
-                    "Please try a shorter query or clear chat history."
-                ) from e
-            else:
-                raise ValueError(
-                    "Invalid Gemini API key. Please check your API key settings or network connection."
-                ) from e
+        messages.append(SystemMessage(content=sys_text))
+        
+        if chat_history:
+            for role, content in chat_history:
+                if role == "assistant":
+                    messages.append(AIMessage(content=content))
+                else:
+                    messages.append(HumanMessage(content=content))
+                    
+        user_prompt = (
+            f"Context information is below.\n"
+            f"---------------------\n"
+            f"{context}\n"
+            f"---------------------\n"
+            f"Given the context information and no prior knowledge, answer the user's query.\n\n"
+            f"Query: {message}"
+        )
+        messages.append(HumanMessage(content=user_prompt))
+        
+    return messages
+
+# ---------------------------------------------------------------------------
+# Agent entry points
+# ---------------------------------------------------------------------------
+def invoke_agent_stream(
+    message: str,
+    chat_history: list = None,
+    system_prompt_override: str = None,
+    filename: str = None,
+    mode: str = "ollama",
+    api_key: str = None,
+):
+    with session_tracer.log_event("agent.retrieve_context", filename=filename, mode=mode) as ev:
+        context = retrieve_context(message, filename=filename, mode=mode, api_key=api_key)
+        ev["context_len"] = len(context)
+
+    if context:
+        print(f"[Agent] Context retrieved — {len(context)} chars for '{filename}'.")
+    else:
+        print(f"[Agent] No context found for '{filename}' — LLM will respond without document context.")
+
+    messages = _build_messages(context, message, chat_history, system_prompt_override)
+    full_response = []
+
+    try:
+        if mode == "gemini":
+            print("[Agent] Streaming with Gemini 3.6 Flash (LangChain)")
+            llm = _get_gemini_llm(api_key)
+            model_name = "gemini-3.6-flash"
         else:
-            raise RuntimeError(f"Gemini API error: {err_msg}") from e
+            print(f"[Agent] Streaming with local Ollama ({OLLAMA_CHAT_MODEL})")
+            llm = _get_ollama_llm()
+            model_name = OLLAMA_CHAT_MODEL
+            
+        session_tracer.start_event(
+            "agent.llm_invoke",
+            mode=mode,
+            model=model_name,
+            filename=filename,
+            streaming=True,
+        )
 
+        chain = llm | StrOutputParser()
+        
+        try:
+            for chunk in chain.stream(messages):
+                if chunk:
+                    full_response.append(chunk)
+                    yield chunk
+        except Exception as oom_err:
+            err_str = str(oom_err).lower()
+            if mode == "ollama" and any(k in err_str for k in ["out of memory", "cuda", "alloc", "buffer", "terminated"]):
+                print("[Agent] GPU OOM detected. Waiting 2 s for VRAM to clear, then retrying on CPU (num_gpu=0)...")
+                import time
+                time.sleep(2)  # Give Ollama time to release VRAM after the failed request
 
+                # Truncate the context in the messages to reduce prefill pressure.
+                # Replace the last HumanMessage content with a trimmed version if it
+                # contains a large context block (indicated by the separator line).
+                truncated_messages = messages.copy()
+                last_human = truncated_messages[-1]
+                if hasattr(last_human, 'content') and '---------------------' in last_human.content:
+                    parts = last_human.content.split('---------------------')
+                    if len(parts) >= 3:
+                        # Keep only the first 600 chars of context to fit in CPU KV-cache
+                        trimmed_ctx = parts[1].strip()[:600]
+                        truncated_messages[-1] = type(last_human)(
+                            content=f"{parts[0]}---------------------\n{trimmed_ctx}\n[Context truncated for CPU fallback]\n---------------------{parts[2]}"
+                        )
 
-def _build_user_prompt(context: str, message: str) -> str:
-    """
-    Build the structured unified prompt for local Ollama Q&A.
-    Uses a unified block layout to prevent safety refusals in small local models.
-    """
-    return (
-        "### Document Text:\n"
-        f"{context}\n\n"
-        "### Task:\n"
-        "Answer the user query below using only the document text provided above. "
-        "Strictly adhere to these guidelines:\n"
-        "1. Answer strictly using ONLY the provided document text facts. Do not assume, extrapolate, or invent.\n"
-        "2. If the context does not explicitly mention the answer to the query, answer exactly: "
-        "\"This information is not present in the provided document.\"\n"
-        "3. Never invent any project, technology, skill, name, date, or experience.\n\n"
-        f"### Query:\n{message}"
-    )
+                llm = _get_ollama_llm(force_cpu=True)
+                chain = llm | StrOutputParser()
+                full_response.clear()
+                for chunk in chain.stream(truncated_messages):
+                    if chunk:
+                        full_response.append(chunk)
+                        yield chunk
+            else:
+                raise oom_err
 
+        session_tracer.end_event(
+            "agent.llm_invoke",
+            status="ok",
+            response_len=len("".join(full_response)),
+        )
+
+    except Exception as e:
+        session_tracer.end_event("agent.llm_invoke", status="error", error=str(e))
+        err_msg = str(e).lower()
+        if mode == "gemini":
+            if "429" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
+                raise RuntimeError("Gemini API rate limit or quota exceeded.") from e
+            elif "api key" in err_msg or "400" in err_msg or "invalid" in err_msg:
+                raise ValueError("Invalid Gemini API key or Token limit exceeded.") from e
+            raise RuntimeError(f"Gemini API error: {e}") from e
+        else:
+            if "out of memory" in err_msg or "cuda" in err_msg or "alloc" in err_msg:
+                raise RuntimeError("Your GPU ran out of memory (VRAM) while loading Ollama.") from e
+            elif "connection" in err_msg or "refused" in err_msg or "11434" in err_msg:
+                raise ConnectionError(f"Ollama is unreachable on {OLLAMA_BASE_URL}.") from e
+            elif "not found" in err_msg or "404" in err_msg:
+                raise NameError(f"Ollama model '{OLLAMA_CHAT_MODEL}' was not found. Run `ollama pull {OLLAMA_CHAT_MODEL}`") from e
+            raise RuntimeError(f"Ollama Q&A error: {e}") from e
 
 def invoke_agent(
     message: str,
@@ -104,76 +216,13 @@ def invoke_agent(
     mode: str = "ollama",
     api_key: str = None,
 ) -> str:
-    """
-    Invoke the AI assistant in either Ollama (local) or Gemini (cloud) mode.
-
-    Args:
-        message:                The user's question.
-        chat_history:           Previous messages [[role, content], ...].
-        system_prompt_override: Optional system prompt override.
-        filename:               Active PDF filename to scope retrieval.
-        mode:                   "ollama" | "gemini"
-        api_key:                Optional custom Gemini API key.
-
-    Returns:
-        Model response string.
-    """
-
-    # 1. Retrieve relevant document chunks
-    try:
-        context = retrieve_context(message, filename=filename)
-    except Exception as e:
-        print(f"Error during retrieval: {e}")
-        context = "No document context available."
-
-    # 2. Gemini path — Google AI Studio API key
-    if mode == "gemini":
-        print("[Agent] Using Gemini 3.6 Flash (Google AI Studio)")
-        return _invoke_gemini(context, message, chat_history or [], api_key=api_key)
-
-    # 3. Ollama local path
-    print(f"[Agent] Using local Ollama ({OLLAMA_CHAT_MODEL})")
-    try:
-        llm = ChatOllama(
-            model=OLLAMA_CHAT_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0.0,
-            num_ctx=8192,
-            repeat_penalty=1.2,
-            top_p=0.1,
+    return "".join(
+        invoke_agent_stream(
+            message=message,
+            chat_history=chat_history,
+            system_prompt_override=system_prompt_override,
+            filename=filename,
+            mode=mode,
+            api_key=api_key,
         )
-
-        if system_prompt_override:
-            system_prompt = system_prompt_override.replace("{context}", context)
-            messages = [("system", system_prompt)]
-            if chat_history:
-                for role, content in chat_history:
-                    lc_role = "ai" if role == "assistant" else "human"
-                    messages.append((lc_role, content))
-            messages.append(("human", message))
-        else:
-            user_prompt = _build_user_prompt(context, message)
-            messages = []
-            if chat_history:
-                for role, content in chat_history:
-                    lc_role = "ai" if role == "assistant" else "human"
-                    messages.append((lc_role, content))
-            messages.append(("human", user_prompt))
-
-        response = llm.invoke(messages)
-        return response.content
-    except Exception as e:
-        err_msg = str(e)
-        if "connection" in err_msg.lower() or "refused" in err_msg.lower() or "connect" in err_msg.lower() or "11434" in err_msg:
-            raise ConnectionError(
-                f"Ollama is not working or unreachable on {OLLAMA_BASE_URL}. "
-                f"Please verify that the Ollama service is running locally. "
-                f"You can start it by running `ollama serve` or opening the Ollama application."
-            ) from e
-        elif "not found" in err_msg.lower() or "404" in err_msg or "model" in err_msg.lower():
-            raise NameError(
-                f"Ollama model '{OLLAMA_CHAT_MODEL}' was not found. "
-                f"Please open your terminal and run `ollama pull {OLLAMA_CHAT_MODEL}` to download it."
-            ) from e
-        else:
-            raise RuntimeError(f"Ollama Q&A error: {err_msg}") from e
+    )

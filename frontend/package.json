@@ -9,10 +9,10 @@
     "dev": "concurrently \"npm run dev:vite\" \"npm run dev:electron\"",
     "build": "vite build",
     "preview": "vite preview",
-    "package:electron": "npm run build && npx electron-packager . LipiAI --platform=win32 --arch=x64 --out=dist-electron --overwrite --ignore=\"src\""
+    "package:electron": "npm run build && electron-packager . LipiAI --platform=win32 --arch=x64 --out=dist-electron --overwrite --icon=icon.ico --ignore=\"^/(src|node_modules|dist-electron)\" --extra-resource=../backend/dist/lipi-backend"
   },
   "keywords": [],
-  "author": "",
+  "author": "Lipi AI",
   "license": "ISC",
   "dependencies": {
     "katex": "^0.18.4",
@@ -36,6 +36,8 @@
   "build": {
     "appId": "com.lipiai.app",
     "productName": "Lipi AI",
+    "npmRebuild": false,
+    "nodeGypRebuild": false,
     "directories": {
       "output": "dist-electron"
     },
@@ -44,10 +46,26 @@
       "electron/**/*",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "../backend/dist/lipi-backend",
+        "to": "backend/lipi-backend",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "win": {
       "target": [
-        "dir"
+        "nsis",
+        "portable"
       ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
     }
   }
 }

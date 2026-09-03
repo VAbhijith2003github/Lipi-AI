@@ -2,11 +2,15 @@ fastapi
 uvicorn[standard]
 python-multipart
 langchain
+langchain-core
 langchain-community
 langchain-ollama
+langchain-chroma
+langchain-google-genai
 chromadb
 pypdf
 pymupdf
 pymupdf4llm
 tiktoken
 docling
+google-genai

@@ -1,34 +1,20 @@
 import tiktoken
-from app.rag.embeddings import CustomOllamaEmbeddings
-from app.rag.ingest import get_collection
-from app.config import FULL_DOC_CHUNK_THRESHOLD, SIMILARITY_TOP_K, MAX_CONTEXT_TOKENS
-
+from app.rag.ingest import get_vectorstore
+from app.config import FULL_DOC_CHUNK_THRESHOLD, SIMILARITY_TOP_K, MAX_CONTEXT_TOKENS, OLLAMA_NUM_CTX
+from app.trace import session_tracer
 
 _encoding = tiktoken.get_encoding("cl100k_base")
 
+_chunk_count_cache: dict[tuple[str, str], int] = {}  # key: (filename, mode)
 
 def _token_count(text: str) -> int:
     return len(_encoding.encode(text))
-
 
 def _trim_to_budget(
     pairs: list[tuple[str, dict]],
     budget: int,
     relevance_first: bool = False,
 ) -> list[tuple[str, dict]]:
-    """
-    Trim (doc, meta) pairs so their total token count stays within `budget`.
-
-    Args:
-        pairs:           (document_text, metadata) pairs to trim.
-        budget:          Maximum total tokens to keep.
-        relevance_first: When True, pairs are assumed to be in descending
-                         relevance order (from a similarity search). The most
-                         relevant chunks are kept, then survivors are re-sorted
-                         by page number so the LLM receives coherent reading order.
-                         When False (full-doc mode), pairs are already in reading
-                         order and no re-sort is applied.
-    """
     kept: list[tuple[str, dict]] = []
     total = 0
     for doc, meta in pairs:
@@ -39,97 +25,124 @@ def _trim_to_budget(
         total += tokens
 
     if relevance_first:
-        # Re-sort survivors by page → chunk_index for coherent LLM reading.
         kept.sort(key=lambda p: (p[1].get("page", 1), p[1].get("chunk_index", 0)))
-
     return kept
 
+def invalidate_chunk_count_cache(filename: str) -> None:
+    keys_to_remove = [k for k in _chunk_count_cache if k[0] == filename]
+    for k in keys_to_remove:
+        _chunk_count_cache.pop(k, None)
 
-def retrieve_context(query: str, filename: str = None, k: int = None) -> str:
+def retrieve_context(query: str, filename: str = None, k: int = None, mode: str = "ollama", api_key: str = None) -> str:
     """
-    Retrieve document context from Chroma, strictly scoped to the active document.
-
-    Strategy by document size:
-      - Small/medium docs (≤ FULL_DOC_CHUNK_THRESHOLD chunks):
-          Return ALL chunks in page/reading order, hard-capped to MAX_CONTEXT_TOKENS.
-      - Large docs (> threshold):
-          Similarity search → keep top-k chunks within MAX_CONTEXT_TOKENS budget
-          (most relevant first) → re-sort survivors by page for LLM coherence.
-
-    Fallback behaviour:
-      If the scoped similarity search returns no results, a single retry is
-      attempted at 2× k, still within the same document scope. There is no
-      cross-document fallback; if the retry also returns nothing, an empty
-      string is returned so the LLM can truthfully say no context is available.
+    Retrieve document context from Chroma via LangChain Retriever, scoped to the active document.
     """
     if k is None:
         k = SIMILARITY_TOP_K
 
-    try:
-        collection = get_collection(filename)
+    # Use 75% of the configured KV-cache (num_ctx) as the retrieval budget.
+    # This guarantees the assembled prompt (context + system prompt + user query)
+    # never causes Ollama to silently expand num_ctx mid-request, which would
+    # allocate extra VRAM during prompt prefill and trigger an OOM crash.
+    token_budget = int(OLLAMA_NUM_CTX * 0.75) if mode == "ollama" else MAX_CONTEXT_TOKENS
 
-        # ── Step 1: For scoped documents, check total chunk count ──
+    try:
+        vectorstore = get_vectorstore(filename, mode=mode, api_key=api_key)
+
         if filename:
             try:
-                all_file_docs = collection.get(where={"source": filename})
-                if all_file_docs and all_file_docs.get("documents"):
-                    file_chunks = all_file_docs["documents"]
-                    file_metas = all_file_docs.get("metadatas", [])
-                    total_chunks = len(file_chunks)
+                cache_key = (filename, mode)
+                if cache_key not in _chunk_count_cache:
+                    _chunk_count_cache[cache_key] = vectorstore._collection.count()
+                total_chunks = _chunk_count_cache[cache_key]
 
-                    # Small/medium documents — return all chunks in reading order,
-                    # trimmed to the context token budget.
+                if total_chunks == 0:
+                    import os
+                    from app.config import UPLOAD_DIR
+                    from app.rag.ingest import ingest_document
+                    file_path = os.path.join(UPLOAD_DIR, filename)
+                    if os.path.isfile(file_path):
+                        print(f"[Retriever] '{filename}' not indexed for mode '{mode}'. Auto-indexing...")
+                        ingest_document(file_path, mode=mode, api_key=api_key)
+                        vectorstore = get_vectorstore(filename, mode=mode, api_key=api_key)
+                        _chunk_count_cache[cache_key] = vectorstore._collection.count()
+                        total_chunks = _chunk_count_cache[cache_key]
+
+                if total_chunks > 0:
                     if 0 < total_chunks <= FULL_DOC_CHUNK_THRESHOLD:
-                        pairs = list(zip(file_chunks, file_metas))
-                        pairs.sort(key=lambda p: (
-                            p[1].get("page", 1),
-                            p[1].get("chunk_index", 0)
-                        ))
-                        pairs = _trim_to_budget(pairs, MAX_CONTEXT_TOKENS, relevance_first=False)
+                        print(f"[Retriever] Full-doc strategy for '{filename}'.")
+                        
+                        retriever = vectorstore.as_retriever(
+                            search_kwargs={"k": total_chunks, "filter": {"source": filename}}
+                        )
+                        # We just do a dummy query to get all sorted by page/index
+                        # Actually a similarity search will return them ordered by relevance.
+                        # Wait, as_retriever with search_type="similarity" is the default. 
+                        # We just want ALL chunks.
+                        # Using raw collection is easier to get all chunks without query embedding overhead:
+                        docs_response = vectorstore._collection.get(where={"source": filename})
+                        docs = docs_response.get("documents", [])
+                        metas = docs_response.get("metadatas", [])
+                        
+                        pairs = list(zip(docs, metas))
+                        pairs.sort(key=lambda p: (p[1].get("page", 1), p[1].get("chunk_index", 0)))
+                        pairs = _trim_to_budget(pairs, token_budget, relevance_first=False)
+                        
                         formatted = [
                             f"--- [Source: {filename} | Page: {m.get('page', 1)} | Section: {m.get('section', 'General')}] ---\n{d}"
                             for d, m in pairs
                         ]
                         return "\n\n".join(formatted)
 
-                    # Large documents — cap k to the actual number of chunks available.
                     k = min(k, total_chunks)
-
             except Exception as get_err:
-                print(f"[Retriever] Error fetching chunks for '{filename}': {get_err}")
+                print(f"[Retriever] Error fetching count: {get_err}")
+                _chunk_count_cache.pop((filename, mode), None)
 
-        # ── Step 2: Vector similarity retrieval, scoped to the active document ──
-        query_embed = CustomOllamaEmbeddings().embed_query(query)
-        kwargs: dict = {"query_embeddings": [query_embed], "n_results": k}
+        # ── Vector similarity retrieval (LangChain native) ──
+        search_kwargs = {"k": k}
         if filename:
-            kwargs["where"] = {"source": filename}
+            search_kwargs["filter"] = {"source": filename}
 
-        results = collection.query(**kwargs)
-        docs = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
+        retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
+        
+        with session_tracer.log_event("retrieve.vector_search", filename=filename, k=k, mode=mode) as ev:
+            try:
+                found_docs = retriever.invoke(query)
+            except Exception as invoke_err:
+                err_str = str(invoke_err).lower()
+                if "dimension" in err_str or "expecting" in err_str or "mismatch" in err_str:
+                    print(f"[Retriever] Dimension mismatch for '{filename}' in {mode} mode: {invoke_err}")
+                    import os
+                    from app.config import UPLOAD_DIR
+                    from app.rag.ingest import ingest_document
+                    file_path = os.path.join(UPLOAD_DIR, filename) if filename else None
+                    if file_path and os.path.isfile(file_path):
+                        print(f"[Retriever] Auto-reindexing '{filename}'...")
+                        ingest_document(file_path, mode=mode, api_key=api_key, force=True)
+                        vectorstore = get_vectorstore(filename, mode=mode, api_key=api_key)
+                        retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
+                        found_docs = retriever.invoke(query)
+                    else:
+                        raise invoke_err
+                else:
+                    raise invoke_err
+            ev["results_returned"] = len(found_docs)
+            
+            # Single retry if none found
+            if not found_docs and filename:
+                retry_k = min(k * 2, 100)
+                print(f"[Retriever] 0 results. Retrying k={retry_k}")
+                retriever.search_kwargs["k"] = retry_k
+                found_docs = retriever.invoke(query)
+                ev["results_after_retry"] = len(found_docs)
 
-        # ── Step 3: Single scoped retry at 2× k — no cross-document fallback ──
-        if not docs and filename:
-            retry_k = min(k * 2, 100)
-            print(
-                f"[Retriever] Scoped query for '{filename}' returned 0 results at k={k}. "
-                f"Retrying with k={retry_k} (same scope)…"
-            )
-            retry_results = collection.query(
-                query_embeddings=[query_embed],
-                n_results=retry_k,
-                where={"source": filename},
-            )
-            docs = retry_results.get("documents", [[]])[0]
-            metas = retry_results.get("metadatas", [[]])[0]
-
-        if not docs:
-            print(f"[Retriever] No context found for query in document '{filename}'.")
+        if not found_docs:
             return ""
 
-        # ── Step 4: Trim to token budget (relevance order), then re-sort by page ──
-        pairs = list(zip(docs, metas))
-        pairs = _trim_to_budget(pairs, MAX_CONTEXT_TOKENS, relevance_first=True)
+        # Trim to token budget and re-sort
+        pairs = [(d.page_content, d.metadata) for d in found_docs]
+        pairs = _trim_to_budget(pairs, token_budget, relevance_first=True)
 
         formatted = [
             f"--- Chunk {i + 1} [Source: {m.get('source', 'Document')} | "
@@ -140,4 +153,4 @@ def retrieve_context(query: str, filename: str = None, k: int = None) -> str:
 
     except Exception as e:
         print(f"[Retriever] Retrieval error: {e}")
-        return ""
+        raise RuntimeError(f"Document retrieval error: {e}") from e

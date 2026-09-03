@@ -24,6 +24,8 @@ Desktop.ini
 *service_account*.json
 gcp_key.json
 key.json
+backend/app/google_credentials.json
+backend/settings.json
 
 
 # Python / Backend
@@ -76,3 +78,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+
+# Runtime session traces (auto-generated, not for version control)
+backend/traces/
+
+# Built installer artifacts
+dist_installer/

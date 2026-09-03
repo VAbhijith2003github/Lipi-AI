@@ -20,12 +20,171 @@
  *       only talk to the Main Process through IPC for security reasons.
  */
 
-const { app, BrowserWindow, Menu } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain } = require('electron');
 const path = require('path');
+const { spawn, exec } = require('child_process');
+const fs = require('fs');
 
 // Check if we're running in development mode
-// In dev mode, Vite serves the React app on localhost:5173
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+let backendProcess = null;
+
+function getPdfPathFromArgs() {
+  const args = process.argv;
+  const startIndex = isDev ? 2 : 1;
+  for (let i = startIndex; i < args.length; i++) {
+    const arg = args[i];
+    if (arg && arg.toLowerCase().endsWith('.pdf')) {
+      try {
+        if (fs.existsSync(arg)) {
+          return path.resolve(arg);
+        }
+      } catch (_) {}
+    }
+  }
+  return null;
+}
+
+// ---- IPC Handlers ----
+ipcMain.handle('get-open-file-arg', () => {
+  return getPdfPathFromArgs();
+});
+
+ipcMain.handle('read-pdf-file', async (event, filePath) => {
+  try {
+    const buffer = fs.readFileSync(filePath);
+    return {
+      filename: path.basename(filePath),
+      data: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength), // ArrayBuffer
+      size: buffer.length
+    };
+  } catch (err) {
+    console.error('[Electron] Error reading PDF file:', err);
+    throw err;
+  }
+});
+
+
+let ollamaStartAttempted = false;
+
+function startOllama() {
+  if (process.platform !== 'win32' || ollamaStartAttempted) return;
+  ollamaStartAttempted = true;
+
+  // Check if Ollama is running first (ping port 11434)
+  const http = require('http');
+  const req = http.request({
+    host: '127.0.0.1',
+    port: 11434,
+    path: '/api/tags',
+    method: 'GET',
+    timeout: 1000
+  }, (res) => {
+    console.log('[Electron] Ollama service detected.');
+  });
+
+  req.on('error', () => {
+    console.log('[Electron] Ollama service not running. Attempting silent startup...');
+
+    const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE, 'AppData', 'Local');
+    const cliPath = path.join(localAppData, 'Programs', 'Ollama', 'ollama.exe');
+    const trayPath = path.join(localAppData, 'Programs', 'Ollama', 'ollama app.exe');
+
+    try {
+      if (fs.existsSync(cliPath)) {
+        console.log('[Electron] Spawning local Ollama daemon silently from:', cliPath);
+        const child = spawn(cliPath, ['serve'], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        child.unref();
+      } else if (fs.existsSync(trayPath)) {
+        console.log('[Electron] Spawning local Ollama tray app silently from:', trayPath);
+        const child = spawn(trayPath, [], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        child.unref();
+      } else {
+        const child = spawn('ollama', ['serve'], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        child.on('error', () => {});
+        child.unref();
+      }
+    } catch (e) {
+      console.warn('[Electron] Could not auto-start Ollama:', e.message);
+    }
+  });
+
+  req.on('timeout', () => {
+    req.destroy();
+  });
+  req.end();
+}
+
+
+function startBackend() {
+  if (isDev) return;
+
+  // Search for the packaged backend executable in extraResources
+  const possiblePaths = [
+    path.join(process.resourcesPath, 'lipi-backend', 'lipi-backend.exe'),
+    path.join(process.resourcesPath, 'backend', 'lipi-backend', 'lipi-backend.exe'),
+    path.join(process.resourcesPath, 'backend', 'lipi-backend.exe'),
+    path.join(__dirname, '..', '..', 'backend', 'dist', 'lipi-backend', 'lipi-backend.exe')
+  ];
+
+  let backendExe = null;
+  const fs = require('fs');
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      backendExe = p;
+      break;
+    }
+  }
+
+  if (backendExe) {
+    console.log('[Electron] Launching backend executable:', backendExe);
+    try {
+      backendProcess = spawn(backendExe, [], {
+        cwd: path.dirname(backendExe),
+        windowsHide: true,
+        stdio: 'ignore',
+        detached: false
+      });
+
+      backendProcess.on('error', (err) => {
+        console.error('[Electron] Failed to start backend process:', err);
+      });
+
+      backendProcess.on('exit', (code, signal) => {
+        console.log(`[Electron] Backend process exited with code ${code}, signal ${signal}`);
+        backendProcess = null;
+      });
+    } catch (err) {
+      console.error('[Electron] Error spawning backend:', err);
+    }
+  } else {
+    console.warn('[Electron] Packaged backend executable not found in resources.');
+  }
+}
+
+function stopBackend() {
+  if (backendProcess && backendProcess.pid) {
+    console.log('[Electron] Terminating backend process PID:', backendProcess.pid);
+    if (process.platform === 'win32') {
+      exec(`taskkill /pid ${backendProcess.pid} /T /F`, () => {});
+    } else {
+      backendProcess.kill('SIGTERM');
+    }
+    backendProcess = null;
+  }
+}
 
 function createWindow() {
   // Disable default menu bar (File, Edit, View, Window, Help)
@@ -38,6 +197,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     title: 'Lipi AI — Smart Document Assistant',
+    icon: path.join(__dirname, '..', 'icon.png'),
     autoHideMenuBar: true,
     titleBarStyle: 'hidden',
     titleBarOverlay: {
@@ -60,8 +220,6 @@ function createWindow() {
   if (isDev) {
     // In development, load from the Vite dev server
     mainWindow.loadURL('http://localhost:5173');
-    // Open DevTools automatically during development
-    // mainWindow.webContents.openDevTools();
   } else {
     // In production, load the built HTML file
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
@@ -69,14 +227,26 @@ function createWindow() {
 }
 
 // ---- App Lifecycle ----
-// Electron fires 'ready' when it has finished initialising.
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  startOllama();
+  startBackend();
+  createWindow();
+});
 
 // Quit the app when all windows are closed (except on macOS)
 app.on('window-all-closed', () => {
+  stopBackend();
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', () => {
+  stopBackend();
+});
+
+app.on('will-quit', () => {
+  stopBackend();
 });
 
 // On macOS, re-create the window when the dock icon is clicked
@@ -85,3 +255,4 @@ app.on('activate', () => {
     createWindow();
   }
 });
+

@@ -15,10 +15,11 @@
 
 - 📑 **Integrated PDF Workspace**: Side-by-side interactive document canvas with thumbnail navigation, zoom controls, and active page jump.
 - 🔒 **Dual AI Execution Modes**:
-  - **Local (Offline)**: 100% private, local document processing powered by Ollama (`llama3.2:1b` + `nomic-embed-text`).
+  - **Local (Offline)**: 100% private, local document processing powered by Ollama (`gemma2:2b` + `nomic-embed-text`).
   - **Cloud (Gemini)**: Fast, high-reasoning intelligence with Google AI Studio (`gemini-3.6-flash`).
+- ⚡ **Memory-Safe Micro-Batched Ingestion**: 10-chunk micro-batches with automatic exponential backoff retry and single-chunk fallback to handle large documents without VRAM/memory crashes.
+- 🛡️ **Mode-Isolated & Self-Healing Vector Store**: Independent ChromaDB persistence paths (`ollama/` vs `gemini/`) with automatic dimension verification and silent auto-reindexing on model changes.
 - 🎯 **Strict Document Grounding**: Guardrail prompts ensure answers are directly retrieved from the document context without hallucinations.
-- ⚡ **Persistent Vector Store**: Documents are ingested, chunked, and indexed into local **ChromaDB** collections for instant recall across sessions.
 - 📐 **Rich Math & Code Support**: Full markdown rendering with **LaTeX** math equations via KaTeX and syntax-highlighted code blocks.
 
 ---
@@ -66,7 +67,7 @@ Ensure you have the following installed on your machine:
 3. **Ollama** *(Optional for local mode)*: ([Download Ollama](https://ollama.com/))
    - Pull the recommended models:
      ```bash
-     ollama pull llama3.2:1b
+     ollama pull gemma2:2b
      ollama pull nomic-embed-text
      ```
 
@@ -112,7 +113,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 
 # Ollama local settings (defaults)
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_CHAT_MODEL=llama3.2:1b
+OLLAMA_CHAT_MODEL=gemma2:2b
 OLLAMA_EMBED_MODEL=nomic-embed-text
 ```
 
@@ -175,18 +176,46 @@ Lipi-AI/
 
 ---
 
-## 📦 Building for Production
+## 📦 Packaging & Distributing the Desktop Application
 
-To package the Electron desktop application into a standalone executable:
+### 1-Click Distributable Build (Windows)
+To create a standalone installer (`Lipi-AI-Setup-1.0.1.exe`) and portable app folder:
 
-```bash
-cd frontend
-npm run package:electron
+```cmd
+build_dist.bat
 ```
-The packaged binary will be generated inside `frontend/dist-electron/`.
+
+This will automatically:
+1. Compile the Python FastAPI backend into a standalone executable using **PyInstaller** (`backend/dist/lipi-backend/`).
+2. Build the production React web bundle.
+3. Package everything with **Electron Builder** into `frontend/dist-electron/`.
+4. Compile the Windows Setup Wizard via **Inno Setup** into `dist_installer/Lipi-AI-Setup-1.0.1.exe`.
+
+For detailed step-by-step instructions on installer features, manual compilation, and deployment troubleshooting, check out the [**Installer Guide (INSTALLER_GUIDE.md)**](file:///d:/DEV%20projects/LLM%20project/INSTALLER_GUIDE.md).
+
+---
+
+## 💻 Running on a Target Laptop (Ollama-Ready)
+
+To share and run the packaged app on any Windows laptop:
+
+1. **Automatic Setup (Recommended)**:
+   - Run `dist_installer/Lipi-AI-Setup-1.0.1.exe`.
+   - The installer wizard will automatically check for Ollama, install it if missing, and pull the required models (`gemma2:2b` & `nomic-embed-text`).
+2. **Manual Setup**:
+   - Install [Ollama for Windows](https://ollama.com/download) and pull models manually:
+     ```bash
+     ollama pull gemma2:2b
+     ollama pull nomic-embed-text
+     ```
+3. **Launch Lipi AI**:
+   - Open Lipi AI from the Start Menu or Desktop shortcut.
+   - The app will automatically manage its internal backend and connect to your local Ollama instance or Gemini API.
+   - *No Python, Node.js, or command-line tools are required on the target laptop!*
 
 ---
 
 ## 📄 License
 
 This project is licensed under the ISC License.
+

@@ -1,110 +1,48 @@
-import json
-import urllib.request
-import urllib.error
+import threading
 from app.config import OLLAMA_BASE_URL, OLLAMA_EMBED_MODEL
 
+from langchain_ollama import OllamaEmbeddings
 
-class CustomOllamaEmbeddings:
+# ---------------------------------------------------------------------------
+# Module-level embedder singleton
+# ---------------------------------------------------------------------------
+# Re-creating OllamaEmbeddings on every ingest/query call is wasteful.
+# The Ollama embedder carries no per-request mutable state (model + base_url
+# are fixed for the process lifetime), so a single shared instance is safe.
+
+_ollama_embedder: OllamaEmbeddings | None = None
+_ollama_embedder_lock = threading.Lock()
+
+
+def get_embedder(mode: str = "ollama", api_key: str = None):
     """
-    Ollama embedding service wrapper.
+    Factory that returns the correct LangChain embedder based on the active mode.
 
-    Primary path  : POST /api/embed  (Ollama ≥ 0.3) — true batch endpoint.
-                    Payload: {"model": "...", "input": ["text1", "text2", ...]}.
-                    One network round-trip for any number of chunks.
-
-    Fallback path : POST /api/embeddings — legacy single-text endpoint,
-                    called sequentially only if the batch endpoint is unavailable.
-
-    NOTE: The chat model is intentionally never used as an embedding fallback.
-    Chat and embedding models operate in different vector spaces; mixing them
-    silently corrupts similarity scores in the vector store.
+    Args:
+        mode:    'ollama' for local Ollama embeddings (singleton reuse),
+                 'gemini' for Google cloud embeddings (per-key instance).
+        api_key: Required when mode='gemini'.
     """
-
-    def __init__(self, model: str = OLLAMA_EMBED_MODEL, base_url: str = OLLAMA_BASE_URL):
-        self.model = model
-        self.base_url = base_url.rstrip("/")
-
-    # ── Low-level helpers ─────────────────────────────────────────────────────
-
-    def _post(self, endpoint: str, payload: dict, timeout: int) -> dict | None:
-        """POST JSON to an Ollama endpoint and return the parsed response dict."""
-        req = urllib.request.Request(
-            f"{self.base_url}{endpoint}",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+    if mode == "gemini":
+        if not api_key:
+            raise ValueError("Google API key is required for Gemini embedding mode.")
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        # We explicitly request 768 dimensions for gemini-embedding-001 if needed
+        return GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            google_api_key=api_key,
+            output_dimensionality=768,
         )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as res:
-                return json.loads(res.read())
-        except urllib.error.HTTPError as e:
-            body = ""
-            try:
-                body = e.read().decode("utf-8", errors="ignore")
-            except Exception:
-                pass
-            print(f"[Embeddings] HTTP {e.code} from {endpoint}: {body}")
-            return None
-        except Exception as e:
-            print(f"[Embeddings] Request error ({endpoint}): {e}")
-            return None
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """
-        Embed a list of texts using a single batch request where possible.
-
-        Attempt 1 — /api/embed (Ollama ≥ 0.3 batch endpoint):
-            One round-trip for the entire list. Preferred for any non-trivial
-            document since it is orders of magnitude faster than sequential calls.
-
-        Attempt 2 — /api/embeddings (legacy sequential):
-            Used only as a last resort when the batch endpoint is unavailable
-            (e.g., older Ollama installations).
-
-        Raises:
-            ConnectionError: If the embedding model cannot be reached via either
-                             endpoint, so ingestion fails cleanly rather than
-                             storing empty/zero vectors.
-        """
-        clean = [t.strip() if t and t.strip() else "empty" for t in texts]
-
-        # ── Attempt 1: batch /api/embed ───────────────────────────────────────
-        data = self._post(
-            "/api/embed",
-            {"model": self.model, "input": clean},
-            timeout=120,
-        )
-        if (
-            data
-            and isinstance(data.get("embeddings"), list)
-            and len(data["embeddings"]) == len(clean)
-        ):
-            print(f"[Embeddings] Batch-embedded {len(clean)} chunks via /api/embed.")
-            return data["embeddings"]
-
-        # ── Attempt 2: sequential legacy /api/embeddings ──────────────────────
-        print(
-            "[Embeddings] /api/embed unavailable or returned wrong count — "
-            "falling back to sequential /api/embeddings."
-        )
-        embeddings: list[list[float]] = []
-        for i, text in enumerate(clean):
-            data = self._post(
-                "/api/embeddings",
-                {"model": self.model, "prompt": text},
-                timeout=30,
+    # Ollama embedder: return the cached singleton, creating it if necessary.
+    global _ollama_embedder
+    if _ollama_embedder is not None:
+        return _ollama_embedder
+    with _ollama_embedder_lock:
+        if _ollama_embedder is None:
+            _ollama_embedder = OllamaEmbeddings(
+                model=OLLAMA_EMBED_MODEL,
+                base_url=OLLAMA_BASE_URL,
+                keep_alive=0
             )
-            if not data or "embedding" not in data:
-                raise ConnectionError(
-                    f"Ollama embedding failed for model '{self.model}' at chunk {i + 1}/{len(clean)}. "
-                    f"Ensure Ollama is running on {self.base_url} and the model is pulled "
-                    f"(run: ollama pull {self.model})."
-                )
-            embeddings.append(data["embedding"])
-
-        return embeddings
-
-    def embed_query(self, text: str) -> list[float]:
-        """Embed a single query string. Reuses embed_documents for consistency."""
-        return self.embed_documents([text])[0]
+    return _ollama_embedder

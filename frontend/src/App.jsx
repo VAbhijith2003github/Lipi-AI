@@ -15,6 +15,8 @@ import { getTruncatedTitle } from './utils/helpers.js';
 import { getFriendlyErrorMessage } from './utils/errorHandling.js';
 import { PdfThumbnail } from './components/PdfThumbnail.jsx';
 import { PdfPageRender } from './components/PdfPageRender.jsx';
+import { StartupGuide } from './components/StartupGuide.jsx';
+import lipiLogo from './icon.png';
 
 function App() {
   const [isAppLoading, setIsAppLoading] = useState(true);
@@ -67,9 +69,21 @@ function App() {
   const [isPagesSidebarOpen, setIsPagesSidebarOpen] = useState(true);
   const [isFileDropdownOpen, setIsFileDropdownOpen] = useState(false);
   const [isCopilotOpen, setIsCopilotOpen] = useState(true);
-  const [modelMode, setModelMode] = useState('ollama'); // 'ollama' | 'gemini'
+  const [modelMode, setModelMode] = useState(() => localStorage.getItem('model-mode') || 'ollama'); // 'ollama' | 'gemini'
+  const [ollamaAvailable, setOllamaAvailable] = useState(true); // optimistic default
+  const [ollamaModelsPresent, setOllamaModelsPresent] = useState(true);
+  const [showStartupGuide, setShowStartupGuide] = useState(() => !localStorage.getItem('lipi-ai-onboarded'));
   const [extractorMode, setExtractorMode] = useState(() => localStorage.getItem('extractor-mode') || 'pymupdf');
   const textareaRef = useRef(null);
+
+  const [isWarmingUp, setIsWarmingUp] = useState(true);
+  const [warmupState, setWarmupState] = useState({
+    chroma: 'pending',
+    embed_model: 'pending',
+    chat_model: 'pending',
+    is_complete: false,
+    is_warming_up: true,
+  });
 
   // Auto-resize textarea height as user types
   useEffect(() => {
@@ -87,25 +101,163 @@ function App() {
     }
   }, [inputValue]);
 
-  // App initialization & backend healthcheck connection
+  // Background AI engine warmup status poller (non-blocking for PDF reader)
   useEffect(() => {
     let active = true;
+    const pollWarmup = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/warmup-status`);
+        if (res.ok && active) {
+          const data = await res.json();
+          setWarmupState(data);
+          if (data.is_complete || !data.is_warming_up) {
+            setIsWarmingUp(false);
+            return;
+          }
+        }
+      } catch (_) {
+        // Backend not ready yet
+      }
+      if (active) setTimeout(pollWarmup, 600);
+    };
+
+    pollWarmup();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // App initialization & backend healthcheck + immediate PDF load from Explorer
+  useEffect(() => {
+    let active = true;
+    let retries = 0;
+    const MAX_RETRIES = 40; // ~16 seconds at 400ms intervals
+
     const checkBackend = async () => {
       try {
         const res = await fetch('http://localhost:8000/');
         if (res.ok && active) {
-          setTimeout(() => {
-            if (active) setIsAppLoading(false);
-          }, 800);
+          // Immediately unblock app loading so PDF is viewable
+          setIsAppLoading(false);
+
+          // Load settings from persistent backend storage
+          try {
+            const settingsRes = await fetch(`${API_BASE}/settings`);
+            if (settingsRes.ok) {
+              const settings = await settingsRes.json();
+              console.log('[React] Loaded persistent backend settings:', settings);
+
+              if (settings.lipi_ai_onboarded !== undefined) {
+                setShowStartupGuide(!settings.lipi_ai_onboarded);
+                localStorage.setItem('lipi-ai-onboarded', settings.lipi_ai_onboarded ? 'true' : 'false');
+              }
+              if (settings.model_mode) {
+                setModelMode(settings.model_mode);
+                localStorage.setItem('model-mode', settings.model_mode);
+              }
+              if (settings.gemini_api_key !== undefined) {
+                setGeminiApiKey(settings.gemini_api_key);
+                localStorage.setItem('gemini-api-key', settings.gemini_api_key);
+              }
+              if (settings.extractor_mode) {
+                setExtractorMode(settings.extractor_mode);
+                localStorage.setItem('extractor-mode', settings.extractor_mode);
+              }
+            }
+          } catch (err) {
+            console.error('[React] Failed to load settings from backend:', err);
+          }
+
+          // Check Ollama availability after backend is ready
+          try {
+            const statusRes = await fetch(`${API_BASE}/status`);
+            if (statusRes.ok) {
+              const status = await statusRes.json();
+              setOllamaAvailable(status.ollama_available);
+              setOllamaModelsPresent(status.required_models_present);
+              if (!status.ollama_available) {
+                if (!localStorage.getItem('model-mode')) {
+                  setModelMode('gemini');
+                  localStorage.setItem('model-mode', 'gemini');
+                }
+              }
+            }
+          } catch (_) { /* status check failure is non-fatal */ }
+
+          // Check if Lipi AI was launched with a PDF file from Windows Explorer
+          if (window.electron) {
+            try {
+              const filePath = await window.electron.getOpenFileArg();
+              if (filePath) {
+                console.log('[React] App started with local PDF argument:', filePath);
+                const fileInfo = await window.electron.readPdfFile(filePath);
+                if (fileInfo && fileInfo.data) {
+                  const blob = new Blob([fileInfo.data], { type: 'application/pdf' });
+                  const file = new File([blob], fileInfo.filename, { type: 'application/pdf' });
+
+                  const typedarray = new Uint8Array(fileInfo.data);
+                  const loadingTask = pdfjsLib.getDocument({ data: typedarray });
+                  const doc = await loadingTask.promise;
+
+                  const docId = fileInfo.filename;
+                  const newDoc = {
+                    id: docId,
+                    filename: fileInfo.filename,
+                    pdfDoc: doc,
+                    numPages: doc.numPages,
+                    currentPage: 1,
+                    messages: [],
+                    isIngested: false,
+                    isLoading: false,
+                    zoomFactor: 1.0,
+                    searchQuery: '',
+                    searchResults: [],
+                    searchMatchIndex: 0,
+                  };
+
+                  setOpenDocuments([newDoc]);
+                  setActiveDocumentId(docId);
+                  setPdfFile(newDoc.filename);
+                  setPdfDoc(newDoc.pdfDoc);
+                  setNumPages(newDoc.numPages);
+                  setCurrentPage(newDoc.currentPage);
+                  setPageInputValue('1');
+                  setMessages(newDoc.messages);
+                  setIsIngested(newDoc.isIngested);
+                  setIsLoading(newDoc.isLoading);
+                  setZoomFactor(newDoc.zoomFactor);
+                  setSearchQuery(newDoc.searchQuery);
+                  setSearchResults(newDoc.searchResults);
+                  setSearchMatchIndex(newDoc.searchMatchIndex);
+
+                  setCurrentView('reader');
+                  saveRecentFile(fileInfo.filename, fileInfo.size);
+                  triggerIngestion(file, docId);
+                }
+              }
+            } catch (err) {
+              console.error('[React] Error loading startup PDF file:', err);
+            }
+          }
           return;
         }
       } catch (e) {
         // Backend not ready yet
       }
-      
-      if (active) {
-        setTimeout(checkBackend, 400); // Poll every 400ms
+
+      if (!active) return;
+
+      retries += 1;
+      if (retries >= MAX_RETRIES) {
+        setIsAppLoading(false);
+        showToast(
+          'Could not connect to the Lipi AI backend after 16 seconds. Please restart the application.',
+          'error'
+        );
+        return;
       }
+
+      setTimeout(checkBackend, 400); // Poll every 400ms
     };
 
     checkBackend();
@@ -255,8 +407,8 @@ function App() {
       if (!response.ok) {
         throw new Error('Failed to clear data on the server.');
       }
-      
-      // Reset frontend states
+
+      // Reset frontend states and navigate to home
       setOpenDocuments([]);
       setActiveDocumentId(null);
       setPdfFile(null);
@@ -267,9 +419,10 @@ function App() {
       setIsIngested(false);
       setIsLoading(false);
       setRecentFiles([]);
+      setCurrentView('home'); // Fix #21: ensure we leave the reader view after clear
       localStorage.removeItem('lipi-ai-recent');
       localStorage.removeItem('wikibuddy-recent');
-      
+
       showToast("All application data has been successfully cleared.", "success");
     } catch (err) {
       showToast(`Error clearing data: ${err.message}`, "error");
@@ -423,7 +576,8 @@ function App() {
     }
   };
 
-  // Perform Keyword Search across PDF pages counting every word occurrence
+  // Perform Keyword Search across PDF pages — processes pages in concurrent
+  // batches of 10 to avoid blocking the UI on large documents.
   const performSearch = async (query) => {
     if (!pdfDoc || !query.trim()) {
       setSearchResults([]);
@@ -433,30 +587,45 @@ function App() {
 
     setIsSearching(true);
     const searchLower = query.toLowerCase().trim();
-    const matches = [];
+    const allMatches = [];
+    const BATCH_SIZE = 10;
 
     try {
-      for (let i = 1; i <= pdfDoc.numPages; i++) {
-        const page = await pdfDoc.getPage(i);
-        const textContent = await page.getTextContent();
-        
-        for (const item of textContent.items) {
-          if (!item.str) continue;
-          const itemStrLower = item.str.toLowerCase();
-          let startIndex = 0;
-          while (true) {
-            const matchIndex = itemStrLower.indexOf(searchLower, startIndex);
-            if (matchIndex === -1) break;
+      const totalPages = pdfDoc.numPages;
 
-            matches.push({
-              page: i,
-              matchNumber: matches.length + 1
-            });
+      for (let batchStart = 1; batchStart <= totalPages; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, totalPages);
+        const pageNums = [];
+        for (let p = batchStart; p <= batchEnd; p++) pageNums.push(p);
 
-            startIndex = matchIndex + searchLower.length;
-          }
+        // Process each batch concurrently
+        const batchResults = await Promise.all(
+          pageNums.map(async (pageNum) => {
+            const page = await pdfDoc.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            const pageMatches = [];
+            for (const item of textContent.items) {
+              if (!item.str) continue;
+              const itemStrLower = item.str.toLowerCase();
+              let startIndex = 0;
+              while (true) {
+                const matchIndex = itemStrLower.indexOf(searchLower, startIndex);
+                if (matchIndex === -1) break;
+                pageMatches.push({ page: pageNum });
+                startIndex = matchIndex + searchLower.length;
+              }
+            }
+            return pageMatches;
+          })
+        );
+
+        for (const pageMatches of batchResults) {
+          allMatches.push(...pageMatches);
         }
       }
+
+      // Assign sequential match numbers
+      const matches = allMatches.map((m, i) => ({ ...m, matchNumber: i + 1 }));
 
       setSearchResults(matches);
       if (matches.length > 0) {
@@ -496,6 +665,25 @@ function App() {
     }
   }, [toast]);
 
+  const saveAppSettings = async (fields) => {
+    const payload = {
+      lipi_ai_onboarded: localStorage.getItem('lipi-ai-onboarded') === 'true',
+      model_mode: localStorage.getItem('model-mode') || 'ollama',
+      gemini_api_key: localStorage.getItem('gemini-api-key') || '',
+      extractor_mode: localStorage.getItem('extractor-mode') || 'pymupdf',
+      ...fields
+    };
+    try {
+      await fetch(`${API_BASE}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      console.error('[React] Failed to persist settings to backend:', err);
+    }
+  };
+
   const showToast = (message, type = 'info') => {
     setToast({ message, type });
   };
@@ -520,7 +708,7 @@ function App() {
   }, [pdfDoc]);
 
   // Auto-Ingest on PDF load
-  const triggerIngestion = async (fileObj, isLocalPath = false, docId) => {
+  const triggerIngestion = async (fileObj, docId) => {
     const updateDoc = (fields) => {
       setOpenDocuments(prev => prev.map(doc => {
         if (doc.id === docId) {
@@ -550,23 +738,23 @@ function App() {
       ]
     });
 
+    // Abort controller for 5-minute ingest timeout (fix #11)
+    const ingestAbort = new AbortController();
+    const ingestTimeout = setTimeout(() => ingestAbort.abort(), 300_000);
+
     try {
-      let response;
-      if (isLocalPath) {
-        response = await fetch(`${API_BASE}/upload-path`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ file_path: fileObj }),
-        });
-      } else {
-        const formData = new FormData();
-        formData.append('file', fileObj);
-        formData.append('extractor', extractorMode);
-        response = await fetch(`${API_BASE}/upload`, {
-          method: 'POST',
-          body: formData,
-        });
+      const formData = new FormData();
+      formData.append('file', fileObj);
+      formData.append('extractor', extractorMode);
+      formData.append('mode', modelMode);
+      if (geminiApiKey) {
+        formData.append('api_key', geminiApiKey);
       }
+      const response = await fetch(`${API_BASE}/upload`, {
+        method: 'POST',
+        signal: ingestAbort.signal,
+        body: formData,
+      });
 
       if (!response.ok) {
         const error = await response.json();
@@ -598,6 +786,8 @@ function App() {
           }
         ]
       });
+    } finally {
+      clearTimeout(ingestTimeout);
     }
   };
 
@@ -668,7 +858,7 @@ function App() {
       setSearchMatchIndex(newDoc.searchMatchIndex);
 
       setCurrentView('reader');
-      triggerIngestion(file, false, docId);
+      triggerIngestion(file, docId);
     } catch (err) {
       showToast(`Could not open file: ${err.message}`, 'error');
     }
@@ -726,7 +916,7 @@ function App() {
 
         setCurrentView('reader');
         saveRecentFile(file.name, file.size);
-        triggerIngestion(file, false, docId);
+        triggerIngestion(file, docId);
       };
       fileReader.readAsArrayBuffer(file);
     } catch (err) {
@@ -749,13 +939,21 @@ function App() {
     if (!customMessage) setInputValue('');
     setIsLoading(true);
 
+    // Abort controller for 90-second chat timeout
+    const chatAbort = new AbortController();
+    const chatTimeout = setTimeout(() => chatAbort.abort(), 90_000);
+
     try {
-      // Filter out error messages from history when passing to backend
-      const validHistory = messages.filter(m => !m.isIngesting && !m.isError).map(m => [m.role, m.content]);
+      // Filter out error/ingestion messages and cap history to last 12 messages
+      const validHistory = messages
+        .filter(m => !m.isIngesting && !m.isError)
+        .map(m => [m.role, m.content])
+        .slice(-12);
 
       const response = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: chatAbort.signal,
         body: JSON.stringify({
           message: messageText,
           chat_history: validHistory,
@@ -766,35 +964,108 @@ function App() {
       });
 
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail || 'Chat request failed');
+        let errorDetail = 'Chat request failed';
+        try {
+          const errorJson = await response.json();
+          errorDetail = errorJson.detail || errorDetail;
+        } catch (_) {}
+        throw new Error(errorDetail);
       }
 
-      const data = await response.json();
-      const assistantMessage = { role: 'assistant', content: data.response };
-      
-      // Clean up previous error message if present at the end before adding the successful one
+      // Add initial placeholder assistant message for streaming
       setMessages(prev => {
         const clean = prev.filter(m => !m.isError);
-        return [...clean, assistantMessage];
+        return [...clean, { role: 'assistant', content: '', isStreaming: true }];
+      });
+
+      // Stream tokens iteratively via SSE reader
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let accumulatedText = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep last partial line
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data: ')) {
+            const jsonStr = trimmed.slice(6);
+            try {
+              const parsed = JSON.parse(jsonStr);
+              if (parsed.error) {
+                throw new Error(parsed.error);
+              }
+              if (parsed.chunk) {
+                accumulatedText += parsed.chunk;
+                setMessages(prev => {
+                  const updated = [...prev];
+                  const lastIdx = updated.length - 1;
+                  if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                    updated[lastIdx] = {
+                      ...updated[lastIdx],
+                      content: accumulatedText,
+                      isStreaming: true,
+                    };
+                  }
+                  return updated;
+                });
+              }
+              if (parsed.done) {
+                setMessages(prev => {
+                  const updated = [...prev];
+                  const lastIdx = updated.length - 1;
+                  if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+                    updated[lastIdx] = {
+                      ...updated[lastIdx],
+                      isStreaming: false,
+                    };
+                  }
+                  return updated;
+                });
+              }
+            } catch (e) {
+              if (e.message && !e.message.includes('JSON')) throw e;
+            }
+          }
+        }
+      }
+
+      // Ensure streaming flag is cleared on completion
+      setMessages(prev => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (lastIdx >= 0 && updated[lastIdx].role === 'assistant') {
+          updated[lastIdx] = {
+            ...updated[lastIdx],
+            isStreaming: false,
+          };
+        }
+        return updated;
       });
     } catch (err) {
       console.error("Chat error:", err);
-      
-      const errorMessage = { 
-        role: 'assistant', 
+
+      const errorMessage = {
+        role: 'assistant',
         content: getFriendlyErrorMessage(err, 'chat'),
         isError: true,
         rawError: err.message,
-        retryMessage: messageText
+        retryMessage: messageText,
       };
-      
+
       setMessages(prev => {
-        // Remove previous error messages at the end to avoid clutter
-        const clean = prev.filter(m => !m.isError);
+        // Clean out empty streaming placeholder if failed before emitting content
+        const clean = prev.filter(m => !m.isError && !(m.role === 'assistant' && m.isStreaming && !m.content));
         return [...clean, errorMessage];
       });
     } finally {
+      clearTimeout(chatTimeout);
       setIsLoading(false);
     }
   };
@@ -831,8 +1102,8 @@ function App() {
   return (
     <div className="app-container">
       {isAppLoading && (
-        <div className="glass-loader-overlay" style={{ position: 'fixed', zIndex: 9999 }}>
-          <div className="glass-loader-card">
+        <div className="startup-loader-overlay" style={{ position: 'fixed', zIndex: 9999 }}>
+          <div className="startup-loader-card">
             <div className="circular-spinner"></div>
             <h3>Launching Lipi AI...</h3>
             <p>Connecting to local FastAPI server and initializing workspace</p>
@@ -852,22 +1123,27 @@ function App() {
       <header className="top-header">
         {/* Top Left: Hamburger menu + Document title + Keyword Search Toggle */}
         <div className="header-left">
-          <button 
-            className="menu-toggle-btn" 
-            onClick={() => setIsPagesSidebarOpen(!isPagesSidebarOpen)}
-            title="Toggle Pages Navigation"
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="3" y1="12" x2="21" y2="12"></line>
-              <line x1="3" y1="6" x2="21" y2="6"></line>
-              <line x1="3" y1="18" x2="21" y2="18"></line>
-            </svg>
-          </button>
+          {currentView !== 'home' && (
+            <button 
+              className="menu-toggle-btn" 
+              onClick={() => setIsPagesSidebarOpen(!isPagesSidebarOpen)}
+              title="Toggle Pages Navigation"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+              </svg>
+            </button>
+          )}
           
           {currentView === 'home' ? (
-            <span className="doc-title" style={{ fontSize: '18px', fontWeight: '700', color: 'var(--text-primary)', paddingLeft: '8px' }}>
-              Lipi AI
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', paddingLeft: '8px' }}>
+              <img src={lipiLogo} alt="Lipi AI Logo" style={{ width: '22px', height: '22px', borderRadius: '4px' }} />
+              <span className="doc-title" style={{ fontSize: '18px', fontWeight: '700', color: 'var(--text-primary)' }}>
+                Lipi AI
+              </span>
+            </div>
           ) : !isSearchOpen ? (
             <div className="dropdown-container">
               <div className="doc-title-container">
@@ -1175,6 +1451,7 @@ function App() {
                       onChange={(e) => {
                         setGeminiApiKey(e.target.value);
                         localStorage.setItem('gemini-api-key', e.target.value);
+                        saveAppSettings({ gemini_api_key: e.target.value });
                       }} 
                       placeholder="Enter Google AI Studio API Key..." 
                       className="settings-input" 
@@ -1186,12 +1463,21 @@ function App() {
                     <label className="settings-label">Default LLM Provider</label>
                     <select 
                       value={modelMode} 
-                      onChange={(e) => setModelMode(e.target.value)} 
+                      onChange={(e) => {
+                        setModelMode(e.target.value);
+                        localStorage.setItem('model-mode', e.target.value);
+                        saveAppSettings({ model_mode: e.target.value });
+                      }} 
                       className="settings-select"
                     >
-                      <option value="ollama">Ollama (Offline Local)</option>
+                      <option value="ollama" disabled={!ollamaAvailable}>Ollama (Offline Local){!ollamaAvailable ? ' — Not Available' : ''}</option>
                       <option value="gemini">Google Gemini (Cloud)</option>
                     </select>
+                    {!ollamaAvailable && (
+                      <span className="settings-hint" style={{ color: 'var(--warning-color, #f59e0b)' }}>
+                        ⚠ Ollama is not running on this machine. Install and start Ollama to enable local mode.
+                      </span>
+                    )}
                   </div>
 
                   <div className="settings-group">
@@ -1201,6 +1487,7 @@ function App() {
                       onChange={(e) => {
                         setExtractorMode(e.target.value);
                         localStorage.setItem('extractor-mode', e.target.value);
+                        saveAppSettings({ extractor_mode: e.target.value });
                       }} 
                       className="settings-select"
                     >
@@ -1212,7 +1499,7 @@ function App() {
                   <div className="settings-group">
                     <label className="settings-label">Local Ollama Model</label>
                     <select disabled className="settings-select">
-                      <option>llama3.2:1b</option>
+                      <option>gemma2:2b</option>
                     </select>
                   </div>
 
@@ -1226,6 +1513,20 @@ function App() {
                       <option value="light">Light Mode</option>
                       <option value="dark">Dark Mode</option>
                     </select>
+                  </div>
+
+                  <div className="settings-group" style={{ borderTop: '1px solid var(--border-color)', paddingTop: '20px' }}>
+                    <label className="settings-label" style={{ color: 'var(--accent-primary)' }}>Setup Guide</label>
+                    <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '12px', lineHeight: '1.5' }}>
+                      Re-open the first-run setup guide to review configuration options.
+                    </p>
+                    <button
+                      onClick={() => setShowStartupGuide(true)}
+                      className="primary-btn"
+                      style={{ width: 'fit-content', padding: '10px 18px', fontWeight: '600' }}
+                    >
+                      View Setup Guide
+                    </button>
                   </div>
 
                   <div className="settings-group" style={{ marginTop: '24px', borderTop: '1px solid var(--border-color)', paddingTop: '20px' }}>
@@ -1308,12 +1609,24 @@ function App() {
               <div className="tools-header">
                 <span>AI MODEL</span>
               </div>
+              {!ollamaAvailable && (
+                <div className="ollama-unavailable-banner">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                  Ollama not detected — Cloud only
+                </div>
+              )}
               <div className="model-mode-toggle">
                 <button
                   id="mode-btn-ollama"
                   className={`mode-btn ${modelMode === 'ollama' ? 'active' : ''}`}
-                  onClick={() => setModelMode('ollama')}
-                  title="Use local Ollama model (offline, private)"
+                  onClick={() => {
+                    if (!ollamaAvailable) return;
+                    setModelMode('ollama');
+                    localStorage.setItem('model-mode', 'ollama');
+                    saveAppSettings({ model_mode: 'ollama' });
+                  }}
+                  title={!ollamaAvailable ? 'Ollama is not running on this machine. Install Ollama to enable local mode.' : 'Use local Ollama model (offline, private)'}
+                  style={!ollamaAvailable ? { cursor: 'not-allowed', opacity: 0.45 } : {}}
                 >
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                     <rect x="2" y="3" width="20" height="14" rx="2"/>
@@ -1325,7 +1638,11 @@ function App() {
                 <button
                   id="mode-btn-gemini"
                   className={`mode-btn ${modelMode === 'gemini' ? 'active' : ''}`}
-                  onClick={() => setModelMode('gemini')}
+                  onClick={() => {
+                    setModelMode('gemini');
+                    localStorage.setItem('model-mode', 'gemini');
+                    saveAppSettings({ model_mode: 'gemini' });
+                  }}
                   title="Use Google Gemini API (cloud, more accurate)"
                 >
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
@@ -1337,7 +1654,7 @@ function App() {
               </div>
               <div className="model-mode-status">
                 {modelMode === 'ollama' ? (
-                  <span className="mode-status-text">Offline · {'{'}llama3.2:1b{'}'}</span>
+                  <span className="mode-status-text">Offline · {'{'}gemma2:2b{'}'}</span>
                 ) : (
                   <span className="mode-status-text mode-status-gemini">Cloud · gemini-3.6-flash</span>
                 )}
@@ -1384,17 +1701,46 @@ function App() {
                 <span>AI Copilot</span>
               </div>
 
-              {/* Quick action chips */}
-              <div className="quick-actions">
-                <button className="action-chip" onClick={() => runQuickAction('explain')} disabled={!isIngested}>Explain</button>
-                <button className="action-chip" onClick={() => runQuickAction('summarize')} disabled={!isIngested}>Summarize</button>
-                <button className="action-chip" onClick={() => runQuickAction('analyze')} disabled={!isIngested}>Analyze</button>
-                <button className="action-chip" onClick={() => runQuickAction('find')} disabled={!isIngested}>Find Key Terms</button>
-              </div>
-
               {/* Chat Messages */}
               <div className="chat-messages">
-                {messages.length === 0 ? (
+                {isWarmingUp && messages.length === 0 ? (
+                  <div className="copilot-warmup-container">
+                    <div className="copilot-warmup-card">
+                      <div className="warmup-icon-wrapper">
+                        <div className="warmup-pulse-ring" />
+                        <div className="warmup-icon-core">
+                          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                          </svg>
+                        </div>
+                      </div>
+                      <div className="warmup-title">Warming Up AI Engine</div>
+                      <div className="warmup-desc">
+                        Priming local models in memory. You can read, zoom, and navigate the PDF right now!
+                      </div>
+                      <div className="warmup-steps-list">
+                        <div className="warmup-step-item">
+                          <span className="warmup-step-name">Vector DB (Chroma)</span>
+                          <span className={`warmup-step-badge ${warmupState.chroma}`}>
+                            {warmupState.chroma === 'ready' ? '✓ Ready' : (warmupState.chroma === 'skipped' ? '⊘ Skipped' : <span className="warmup-mini-spinner" />)}
+                          </span>
+                        </div>
+                        <div className="warmup-step-item">
+                          <span className="warmup-step-name">Embedding Model</span>
+                          <span className={`warmup-step-badge ${warmupState.embed_model}`}>
+                            {warmupState.embed_model === 'ready' ? '✓ Ready' : (warmupState.embed_model === 'skipped' ? '⊘ Skipped' : <span className="warmup-mini-spinner" />)}
+                          </span>
+                        </div>
+                        <div className="warmup-step-item">
+                          <span className="warmup-step-name">Chat LLM ({modelMode === 'gemini' ? 'Gemini' : 'Gemma2'})</span>
+                          <span className={`warmup-step-badge ${warmupState.chat_model}`}>
+                            {warmupState.chat_model === 'ready' ? '✓ Ready' : (warmupState.chat_model === 'skipped' ? '⊘ Skipped' : <span className="warmup-mini-spinner" />)}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : messages.length === 0 ? (
                   <div className="copilot-empty-state">
                     <p>Open a document to enable intelligent vector search and AI assistance.</p>
                   </div>
@@ -1403,14 +1749,17 @@ function App() {
                     <div key={i} className={`message ${msg.role} ${msg.isError ? 'error-message' : ''}`}>
                       <div className={`message-content ${msg.isIngesting ? 'ingest-flashing-text' : ''}`}>
                         {msg.role === 'assistant' ? (
-                          <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{msg.content}</ReactMarkdown>
+                          <>
+                            <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{msg.content}</ReactMarkdown>
+                            {msg.isStreaming && <span className="streaming-cursor" />}
+                          </>
                         ) : (
                           msg.content
                         )}
                       </div>
                       {msg.role === 'assistant' && !msg.isIngesting && (
                         <div className="message-actions">
-                          {!msg.isError && (
+                          {!msg.isError && !msg.isStreaming && (
                             <button 
                               className="msg-action-btn copy-btn" 
                               onClick={() => navigator.clipboard.writeText(msg.content).then(() => {
@@ -1444,7 +1793,7 @@ function App() {
                     </div>
                   ))
                 )}
-                {isLoading && (
+                {isLoading && messages.length > 0 && !messages[messages.length - 1].isStreaming && (
                   <div className="message assistant">
                     <div className="typing-indicator">
                       <span className="typing-dot"></span>
@@ -1458,10 +1807,37 @@ function App() {
 
               {/* Chat Input */}
               <div className="copilot-input-container">
+                {/* Quick action chips */}
+                <div className="quick-actions">
+                  <button className="action-chip" onClick={() => runQuickAction('explain')} disabled={!isIngested || isWarmingUp || (modelMode === 'gemini' && !geminiApiKey)}>Explain</button>
+                  <button className="action-chip" onClick={() => runQuickAction('summarize')} disabled={!isIngested || isWarmingUp || (modelMode === 'gemini' && !geminiApiKey)}>Summarize</button>
+                  <button className="action-chip" onClick={() => runQuickAction('analyze')} disabled={!isIngested || isWarmingUp || (modelMode === 'gemini' && !geminiApiKey)}>Analyze</button>
+                  <button className="action-chip" onClick={() => runQuickAction('find')} disabled={!isIngested || isWarmingUp || (modelMode === 'gemini' && !geminiApiKey)}>Find Key Terms</button>
+                </div>
+                {modelMode === 'gemini' && !geminiApiKey && (
+                  <div className="gemini-key-warning">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                    <span>
+                      Gemini API key required.{' '}
+                      <button
+                        className="gemini-key-warning-link"
+                        onClick={() => { setCurrentView('home'); setHomeTab('settings'); }}
+                      >
+                        Configure in Settings →
+                      </button>
+                    </span>
+                  </div>
+                )}
                 <div className="chat-input-box">
                   <textarea
                     ref={textareaRef}
-                    placeholder={isIngested ? "Ask AI Copilot..." : "Awaiting document..."}
+                    placeholder={
+                      modelMode === 'gemini' && !geminiApiKey
+                        ? 'Configure your Gemini API key in Settings to start chatting.'
+                        : isWarmingUp
+                        ? 'Warming up AI engine (PDF is ready to read)...'
+                        : isIngested ? 'Ask AI Copilot...' : 'Awaiting document...'
+                    }
                     value={inputValue}
                     onChange={(e) => setInputValue(e.target.value)}
                     onKeyDown={(e) => {
@@ -1470,13 +1846,13 @@ function App() {
                         handleSendMessage();
                       }
                     }}
-                    disabled={!isIngested || isLoading}
+                    disabled={!isIngested || isLoading || isWarmingUp || (modelMode === 'gemini' && !geminiApiKey)}
                     rows={1}
                   />
                   <button 
                     className="send-icon-btn" 
                     onClick={() => handleSendMessage()}
-                    disabled={!isIngested || !inputValue.trim() || isLoading}
+                    disabled={!isIngested || !inputValue.trim() || isLoading || isWarmingUp || (modelMode === 'gemini' && !geminiApiKey)}
                   >
                     ➔
                   </button>
@@ -1551,8 +1927,35 @@ function App() {
                 </svg>
               </button>
             </div>
-          </div>
         </div>
+        </div>
+      )}
+
+      {/* ---- STARTUP GUIDE MODAL ---- */}
+      {showStartupGuide && (
+        <StartupGuide
+          ollamaAvailable={ollamaAvailable}
+          ollamaModelsPresent={ollamaModelsPresent}
+          initialMode={modelMode}
+          initialApiKey={geminiApiKey}
+          onFinish={({ mode, apiKey }) => {
+            if (mode) {
+              setModelMode(mode);
+              localStorage.setItem('model-mode', mode);
+            }
+            if (apiKey !== undefined) {
+              setGeminiApiKey(apiKey);
+              localStorage.setItem('gemini-api-key', apiKey);
+            }
+            localStorage.setItem('lipi-ai-onboarded', 'true');
+            setShowStartupGuide(false);
+            saveAppSettings({
+              lipi_ai_onboarded: true,
+              model_mode: mode || 'ollama',
+              gemini_api_key: apiKey || ''
+            });
+          }}
+        />
       )}
     </div>
   );
