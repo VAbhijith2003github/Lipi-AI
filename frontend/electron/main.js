@@ -20,7 +20,7 @@
  *       only talk to the Main Process through IPC for security reasons.
  */
 
-const { app, BrowserWindow, Menu, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, shell } = require('electron');
 const path = require('path');
 const { spawn, exec } = require('child_process');
 const fs = require('fs');
@@ -28,6 +28,11 @@ const fs = require('fs');
 // Check if we're running in development mode
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 let backendProcess = null;
+
+function isTrustedRenderer(event) {
+  const url = event.senderFrame?.url || '';
+  return url.startsWith('file:') || (isDev && url.startsWith('http://localhost:5173'));
+}
 
 function getPdfPathFromArgs() {
   const args = process.argv;
@@ -51,6 +56,9 @@ ipcMain.handle('get-open-file-arg', () => {
 });
 
 ipcMain.handle('read-pdf-file', async (event, filePath) => {
+  if (!isTrustedRenderer(event)) throw new Error('Untrusted renderer.');
+  const approvedPath = getPdfPathFromArgs();
+  if (!approvedPath || path.resolve(filePath) !== approvedPath) throw new Error('File was not approved at launch.');
   try {
     const buffer = fs.readFileSync(filePath);
     return {
@@ -62,6 +70,13 @@ ipcMain.handle('read-pdf-file', async (event, filePath) => {
     console.error('[Electron] Error reading PDF file:', err);
     throw err;
   }
+});
+
+ipcMain.handle('open-external-url', async (event, url) => {
+  if (!isTrustedRenderer(event) || typeof url !== 'string') throw new Error('Invalid URL request.');
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:' || !['ollama.com', 'aistudio.google.com'].includes(parsed.hostname)) throw new Error('URL is not allowlisted.');
+  await shell.openExternal(parsed.toString());
 });
 
 
@@ -211,10 +226,15 @@ function createWindow() {
       // Security: disable direct Node.js access from the renderer
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
     },
   });
 
   mainWindow.setMenu(null);
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('file:') && !(isDev && url.startsWith('http://localhost:5173'))) event.preventDefault();
+  });
 
   // ---- Load the React app ----
   if (isDev) {
@@ -255,4 +275,3 @@ app.on('activate', () => {
     createWindow();
   }
 });
-

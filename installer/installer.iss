@@ -7,7 +7,7 @@
 #define MyAppVersion "1.0.1"
 #define MyAppPublisher "Lipi AI"
 #define MyAppURL "https://github.com/VAbhijith2003github/Lipi-AI"
-#define MyAppExeName "LipiAI.exe"
+#define MyAppExeName "Lipi AI.exe"
 
 [Setup]
 AppId={{C8E11082-A745-42DE-8C39-166D57F73961}
@@ -49,7 +49,7 @@ Name: "configure_ollama"; Description: "Verify Ollama and Download Local AI Mode
 
 [Files]
 ; All files from the built Electron + FastAPI package
-Source: "..\frontend\dist-electron\LipiAI-win32-x64\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\frontend\dist-electron\win-unpacked\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Ollama setup helper script
 Source: "setup_ollama.bat"; DestDir: "{app}"; Flags: ignoreversion
 

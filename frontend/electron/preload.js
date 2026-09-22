@@ -9,5 +9,8 @@ contextBridge.exposeInMainWorld('electron', {
   },
   getOpenFileArg: async () => {
     return ipcRenderer.invoke('get-open-file-arg');
+  },
+  openExternalUrl: async (url) => {
+    return ipcRenderer.invoke('open-external-url', url);
   }
 });

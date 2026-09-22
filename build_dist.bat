@@ -102,7 +102,7 @@ echo ===================================================================
 echo.
 echo Your distributable files:
 echo   - Standalone Installer (.exe): %ROOT_DIR%dist_installer\Lipi-AI-Setup-1.0.1.exe (if Inno Setup installed)
-echo   - Portable App Folder:        %FRONTEND_DIR%\dist-electron\LipiAI-win32-x64\
+echo   - Portable App Folder:        %FRONTEND_DIR%\dist-electron\win-unpacked\
 echo.
 echo Features in the Installer:
 echo   1. Prompts for custom installation location

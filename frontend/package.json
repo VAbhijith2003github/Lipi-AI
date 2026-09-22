@@ -9,7 +9,7 @@
     "dev": "concurrently \"npm run dev:vite\" \"npm run dev:electron\"",
     "build": "vite build",
     "preview": "vite preview",
-    "package:electron": "npm run build && electron-packager . LipiAI --platform=win32 --arch=x64 --out=dist-electron --overwrite --icon=icon.ico --ignore=\"^/(src|node_modules|dist-electron)\" --extra-resource=../backend/dist/lipi-backend"
+    "package:electron": "npm run build && electron-builder --win nsis portable"
   },
   "keywords": [],
   "author": "Lipi AI",
@@ -56,6 +56,7 @@
       }
     ],
     "win": {
+      "signAndEditExecutable": false,
       "target": [
         "nsis",
         "portable"

@@ -9,7 +9,8 @@ import 'katex/dist/katex.min.css';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
-const API_BASE = 'http://localhost:8000/api';
+const API_ORIGIN = 'http://127.0.0.1:8000';
+const API_BASE = `${API_ORIGIN}/api`;
 
 import { getTruncatedTitle } from './utils/helpers.js';
 import { getFriendlyErrorMessage } from './utils/errorHandling.js';
@@ -39,8 +40,10 @@ function App() {
     } catch { return []; }
   });
 
-  // File currently being shared (triggers share modal)
+  // Retained only to keep older persisted UI state harmless; sharing is disabled.
   const [sharingFile, setSharingFile] = useState(null);
+
+  // File currently being shared (triggers share modal)
 
   // Theme state: default light mode as requested in screenshot, toggleable
   const [theme, setTheme] = useState(() => localStorage.getItem('app-theme') || 'light');
@@ -104,6 +107,8 @@ function App() {
   // Background AI engine warmup status poller (non-blocking for PDF reader)
   useEffect(() => {
     let active = true;
+    let attempts = 0;
+    const MAX_WARMUP_ATTEMPTS = 40;
     const pollWarmup = async () => {
       try {
         const res = await fetch(`${API_BASE}/warmup-status`);
@@ -117,6 +122,14 @@ function App() {
         }
       } catch (_) {
         // Backend not ready yet
+      }
+      attempts += 1;
+      if (attempts >= MAX_WARMUP_ATTEMPTS) {
+        if (active) {
+          setIsWarmingUp(false);
+          setWarmupState(prev => ({ ...prev, is_warming_up: false, is_complete: true, chroma: 'skipped' }));
+        }
+        return;
       }
       if (active) setTimeout(pollWarmup, 600);
     };
@@ -135,8 +148,9 @@ function App() {
 
     const checkBackend = async () => {
       try {
-        const res = await fetch('http://localhost:8000/');
-        if (res.ok && active) {
+        const res = await fetch(`${API_ORIGIN}/`);
+        const identity = res.ok ? await res.json() : null;
+        if (res.ok && identity?.app === 'lipi-ai-desktop' && active) {
           // Immediately unblock app loading so PDF is viewable
           setIsAppLoading(false);
 
@@ -1865,7 +1879,7 @@ function App() {
       )}
 
       {/* ---- SHARE MODAL ---- */}
-      {sharingFile && (
+      {false && sharingFile && (
         <div className="share-overlay" onClick={() => setSharingFile(null)}>
           <div className="share-modal" onClick={e => e.stopPropagation()}>
             <div className="share-modal-header">

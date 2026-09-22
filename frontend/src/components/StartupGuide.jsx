@@ -32,11 +32,7 @@ export function StartupGuide({
   };
 
   const openExternal = (url) => {
-    if (window.electron?.shell) {
-      window.electron.shell.openExternal(url);
-    } else {
-      window.open(url, '_blank');
-    }
+    window.electron?.openExternalUrl?.(url).catch(console.error);
   };
 
   const steps = [

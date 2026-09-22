@@ -151,6 +151,7 @@ async def root():
     """
     print("[Health] Health-check endpoint hit — server is alive.")
     return {
+        "app": "lipi-ai-desktop",
         "message": "Lipi AI API is running!",
         "docs": "Visit /docs for the interactive API documentation.",
     }
