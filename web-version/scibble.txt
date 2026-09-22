@@ -1,0 +1,16 @@
+{
+  "document_id": "doc_40b08007",
+  "filename": "V Abhijith Resume September.pdf",
+  "cloud_url": "https://res.cloudinary.com/mpz4grd5/raw/upload/v1789027825/lipi/documents/szfarwolnrf9ixw3ky1b.pdf",
+  "page_count": 1,
+  "chunk_count": 6
+}
+Response headers
+ access-control-allow-credentials: true 
+ access-control-allow-origin: * 
+ content-length: 219 
+ content-type: application/json 
+ date: Thu,10 Sep 2026 08:10:10 GMT 
+ server: uvicorn 
+
+done

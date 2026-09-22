@@ -1,0 +1,7 @@
+backend/.env
+backend/venv/
+backend/lipi_app.db
+backend/__pycache__/
+backend/app/**/__pycache__/
+frontend/lipi_web/.env
+frontend/lipi_web/build/
